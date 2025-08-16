@@ -8,6 +8,11 @@
 (define-constant err-not-subscribed (err u106))
 (define-constant err-invalid-threshold (err u107))
 (define-constant err-subscription-limit-reached (err u108))
+(define-constant err-not-qualified-validator (err u109))
+(define-constant err-already-validated (err u110))
+(define-constant err-validation-not-found (err u111))
+(define-constant err-source-not-pending (err u112))
+(define-constant err-insufficient-validations (err u113))
 
 (define-data-var total-sources uint u0)
 (define-data-var total-reports uint u0)
@@ -15,6 +20,10 @@
 (define-data-var total-subscriptions uint u0)
 (define-data-var max-subscriptions-per-user uint u50)
 (define-data-var subscription-fee uint u5)
+(define-data-var min-validator-reports uint u5)
+(define-data-var min-validator-reputation uint u10)
+(define-data-var required-validations uint u3)
+(define-data-var validator-reward uint u20)
 
 (define-map water-sources
     uint 
@@ -88,7 +97,7 @@
                 name: name,
                 latitude: latitude,
                 longitude: longitude,
-                status: "active",
+                status: "pending",
                 total-reports: u0,
                 created-by: tx-sender
             }
@@ -142,6 +151,7 @@
          (fee (var-get subscription-fee)))
         
         (asserts! (is-some (map-get? water-sources source-id)) (err err-invalid-source))
+        (asserts! (is-eq (get status (unwrap! (map-get? water-sources source-id) (err err-invalid-source))) "active") (err err-source-not-pending))
         (asserts! (< quality-threshold u11) (err err-invalid-threshold))
         (asserts! (is-none (map-get? user-subscriptions subscription-key)) (err err-already-subscribed))
         (asserts! (< (get count current-count) (var-get max-subscriptions-per-user)) (err err-subscription-limit-reached))
@@ -404,6 +414,225 @@
     )
 )
 
+(define-map source-validations
+    { source-id: uint, validator: principal }
+    {
+        validation-type: (string-ascii 20),
+        timestamp: uint,
+        notes: (string-ascii 200),
+        verified: bool
+    }
+)
+
+(define-map validation-summary
+    uint
+    {
+        validation-count: uint,
+        approval-count: uint,
+        rejection-count: uint,
+        status: (string-ascii 20)
+    }
+)
+
+(define-map qualified-validators
+    principal
+    {
+        total-validations: uint,
+        successful-validations: uint,
+        validation-score: uint,
+        is-active: bool
+    }
+)
+
+(define-public (validate-water-source 
+    (source-id uint) 
+    (validation-type (string-ascii 20))
+    (notes (string-ascii 200)))
+    (let
+        ((source (unwrap! (map-get? water-sources source-id) (err err-invalid-source)))
+         (validator-stats (unwrap! (map-get? reporter-stats tx-sender) (err err-not-qualified-validator)))
+         (validation-key {source-id: source-id, validator: tx-sender}))
+        
+        (asserts! (is-eq (get status source) "pending") (err err-source-not-pending))
+        (asserts! (>= (get total-reports validator-stats) (var-get min-validator-reports)) (err err-not-qualified-validator))
+        (asserts! (>= (get reputation-score validator-stats) (var-get min-validator-reputation)) (err err-not-qualified-validator))
+        (asserts! (is-none (map-get? source-validations validation-key)) (err err-already-validated))
+        (asserts! (or (is-eq validation-type "approve") (is-eq validation-type "reject")) (err err-invalid-quality))
+        
+        (map-set source-validations validation-key
+            {
+                validation-type: validation-type,
+                timestamp: stacks-block-height,
+                notes: notes,
+                verified: true
+            }
+        )
+        
+        (update-validator-stats tx-sender)
+        (update-validation-summary source-id validation-type)
+        (unwrap! (check-validation-completion source-id) (err err-insufficient-validations))
+        
+        (ok true)
+    )
+)
+
+(define-public (register-as-validator)
+    (let
+        ((reporter-stats-data (unwrap! (map-get? reporter-stats tx-sender) (err err-not-qualified-validator))))
+        
+        (asserts! (>= (get total-reports reporter-stats-data) (var-get min-validator-reports)) (err err-not-qualified-validator))
+        (asserts! (>= (get reputation-score reporter-stats-data) (var-get min-validator-reputation)) (err err-not-qualified-validator))
+        
+        (map-set qualified-validators tx-sender
+            {
+                total-validations: u0,
+                successful-validations: u0,
+                validation-score: u0,
+                is-active: true
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (deactivate-validator (validator principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        
+        (let
+            ((validator-data (unwrap! (map-get? qualified-validators validator) (err err-not-qualified-validator))))
+            (map-set qualified-validators validator
+                (merge validator-data {is-active: false})
+            )
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (update-validation-requirements 
+    (min-reports uint) 
+    (min-reputation uint) 
+    (required-vals uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (var-set min-validator-reports min-reports)
+        (var-set min-validator-reputation min-reputation)
+        (var-set required-validations required-vals)
+        (ok true)
+    )
+)
+
+(define-public (update-validator-reward (new-reward uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (var-set validator-reward new-reward)
+        (ok true)
+    )
+)
+
+(define-public (force-activate-source (source-id uint))
+    (let
+        ((source (unwrap! (map-get? water-sources source-id) (err err-invalid-source))))
+        
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (asserts! (is-eq (get status source) "pending") (err err-source-not-pending))
+        
+        (map-set water-sources source-id
+            (merge source {status: "active"})
+        )
+        
+        (ok true)
+    )
+)
+
+(define-private (update-validator-stats (validator principal))
+    (let
+        ((current-validator-stats (default-to 
+            {total-validations: u0, successful-validations: u0, validation-score: u0, is-active: true}
+            (map-get? qualified-validators validator))))
+        (map-set qualified-validators validator
+            {
+                total-validations: (+ (get total-validations current-validator-stats) u1),
+                successful-validations: (+ (get successful-validations current-validator-stats) u1),
+                validation-score: (+ (get validation-score current-validator-stats) u2),
+                is-active: (get is-active current-validator-stats)
+            }
+        )
+    )
+)
+
+(define-private (update-validation-summary (source-id uint) (validation-type (string-ascii 20)))
+    (let
+        ((current-summary (default-to 
+            {validation-count: u0, approval-count: u0, rejection-count: u0, status: "pending"}
+            (map-get? validation-summary source-id)))
+         (is-approval (is-eq validation-type "approve"))
+         (new-validation-count (+ (get validation-count current-summary) u1))
+         (new-approval-count (if is-approval 
+                               (+ (get approval-count current-summary) u1)
+                               (get approval-count current-summary)))
+         (new-rejection-count (if (not is-approval) 
+                                (+ (get rejection-count current-summary) u1)
+                                (get rejection-count current-summary))))
+        
+        (map-set validation-summary source-id
+            {
+                validation-count: new-validation-count,
+                approval-count: new-approval-count,
+                rejection-count: new-rejection-count,
+                status: "pending"
+            }
+        )
+    )
+)
+
+(define-private (check-validation-completion (source-id uint))
+    (let
+        ((summary (unwrap! (map-get? validation-summary source-id) (err err-validation-not-found)))
+         (source (unwrap! (map-get? water-sources source-id) (err err-invalid-source)))
+         (required-vals (var-get required-validations)))
+        
+        (if (>= (get validation-count summary) required-vals)
+            (let
+                ((approval-ratio (* (get approval-count summary) u100))
+                 (total-validations (get validation-count summary))
+                 (approval-percentage (/ approval-ratio total-validations)))
+                
+                (if (>= approval-percentage u60)
+                    (begin
+                        (map-set water-sources source-id
+                            (merge source {status: "active"})
+                        )
+                        (map-set validation-summary source-id
+                            (merge summary {status: "approved"})
+                        )
+                        (unwrap! (reward-validators source-id) (err err-insufficient-funds))
+                        (ok true))
+                    (begin
+                        (map-set water-sources source-id
+                            (merge source {status: "rejected"})
+                        )
+                        (map-set validation-summary source-id
+                            (merge summary {status: "rejected"})
+                        )
+                        (ok false))))
+            (ok false))
+    )
+)
+
+(define-private (reward-validators (source-id uint))
+    (let
+        ((validation-reward (var-get validator-reward)))
+        (pay-validator-reward contract-owner validation-reward)
+    )
+)
+
+(define-private (pay-validator-reward (validator principal) (amount uint))
+    (stx-transfer? amount contract-owner validator)
+)
+
 (define-read-only (get-water-source (source-id uint))
     (map-get? water-sources source-id)
 )
@@ -451,3 +680,29 @@
 (define-read-only (get-max-subscriptions-per-user)
     (var-get max-subscriptions-per-user)
 )
+
+(define-read-only (get-source-validation (source-id uint) (validator principal))
+    (map-get? source-validations {source-id: source-id, validator: validator})
+)
+
+(define-read-only (get-validation-summary (source-id uint))
+    (map-get? validation-summary source-id)
+)
+
+(define-read-only (get-qualified-validator (validator principal))
+    (map-get? qualified-validators validator)
+)
+
+(define-read-only (get-validation-requirements)
+    {
+        min-validator-reports: (var-get min-validator-reports),
+        min-validator-reputation: (var-get min-validator-reputation),
+        required-validations: (var-get required-validations),
+        validator-reward: (var-get validator-reward)
+    }
+)
+
+
+
+
+
